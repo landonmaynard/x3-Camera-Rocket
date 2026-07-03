@@ -4,5 +4,5 @@ ive decided to just make the fincan as light as possible, it is almost impossibl
 
 fri july 3
 after some research, i need to create a much better camera mount, that should have some vibration resistance, and most likely taping it to the wall instead of just relying on friction.
-
+Planning on using elliptical fins, they tend to be what most sites say as most stable. I also need to work out a way to minimize spin.
 
