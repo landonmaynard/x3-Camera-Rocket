@@ -30,7 +30,7 @@ BME280 bmp;
 TaskHandle_t bmpTask;
 
 //STATES
-volatile bool onGround=true;
+volatile bool beforeFlight = true;
 volatile bool apogeeDetected;
 volatile bool landingDetected;
 
@@ -52,7 +52,7 @@ int landingDetectionTime = 5; //seconds
 int landingDetectionHZ = 5; //checks x times per second in the span of landingDetectionTime
 int landingDetectionIndex = 0; //index for landing detection counter
 int landingDetectionAmount = landingDetectionTime * landingDetectionHZ; //convert seconds to number of readings
-int landingDetectionDelay = landingDetectionHZ/1000; //how much to wait in between readings for landing detection
+int landingDetectionDelay = 1000 / landingDetectionHZ; //how much to wait in between readings for landing detection
 unsigned long landingPrevMillis;
 
 //saving altitudes to ram
@@ -63,18 +63,19 @@ struct bmpData{
   unsigned long timeM;
 };
 bmpData* bmpDataArray = NULL;
-const int bmpDataArraySize = 40000;
+const int bmpDataArraySize = 80000;
 int currentIndex = 0;
 int bmpDataHZ = 60; //how many times per second to save altitude data to ram
 int bmpDataDelay = 1000/bmpDataHZ; //how many milliseconds to wait between saving data to ram
+int bmpPreviousMillis = 0;
 
 //video vars
 File videoFile;
 bool recording = false;
 bool recordingDescent = false;
 unsigned long lastFrameMillis = 0;
-const int videoFPS = 30;
-const unsigned long videoFrameDelay = 1000/videoFPS; //how many milliseconds to wait between frames
+int videoFPS = 25;
+unsigned long videoFrameDelay = 1000/videoFPS; //how many milliseconds to wait between frames
 
 // put function declarations here:
 bool detectLaunch();
@@ -117,7 +118,7 @@ camera_config_t config;
 
   config.frame_size = FRAMESIZE_UXGA; // FRAMESIZE_ + QVGA|CIF|VGA|SVGA|XGA|SXGA|UXGA
   config.jpeg_quality = 10;
-  config.fb_count = 2;
+  config.fb_count = 4;
   
   // Init Camera
   esp_err_t err = esp_camera_init(&config);
@@ -150,19 +151,20 @@ camera_config_t config;
   s->set_colorbar(s, 0);       // 0 = disable , 1 = enable 
   }
 
-  SD_MMC.begin();
+  SD_MMC.begin("/sdcard", false);
   uint8_t cardType = SD_MMC.cardType();
 
   camera_fb_t * fb = NULL;
 
   bmpDataArray = (bmpData*)ps_malloc(sizeof(bmpData) * bmpDataArraySize);
   xTaskCreatePinnedToCore(bmpTaskCode, "bmpTask", 10000, NULL, 0, &bmpTask, 0);
+  pinMode(2, INPUT_PULLUP);
 }
 
 void loop() {
   // put your main code here, to run repeatedly:
-  if(onGround && !recording && !apogeeDetected){
-    videoFile = SD_MMC.open("/ascent.avi", FILE_WRITE);
+  if(beforeFlight && !recording && !apogeeDetected){
+    videoFile = SD_MMC.open("/ascent.mjpeg", FILE_WRITE);
     if(videoFile){
       recording = true;
       lastFrameMillis = millis();
@@ -184,25 +186,31 @@ void loop() {
 
     sensor_t * s = esp_camera_sensor_get();
     s->set_framesize(s, FRAMESIZE_UXGA); //return to UXGA for the high-res descent video recording
+    videoFPS=5;
+    videoFrameDelay = 1000/videoFPS; //how many milliseconds to wait between frames
     delay(250); //wait for camera to adjust to new resolution
   }
   if(apogeeDetected && !recordingDescent && !landingDetected){
-    videoFile = SD_MMC.open("/descent.avi", FILE_WRITE);
+    videoFile = SD_MMC.open("/descent.mjpeg", FILE_WRITE);
     if(videoFile){
       recordingDescent = true;
       lastFrameMillis = millis();
     }
   }
   if(recordingDescent && !landingDetected){
-    camera_fb_t * fb = esp_camera_fb_get();
-    if(fb){
-      videoFile.write(fb->buf, fb->len);
-      esp_camera_fb_return(fb);
+    if(millis() - lastFrameMillis >= videoFrameDelay){
+      lastFrameMillis = millis();
+      camera_fb_t * fb = esp_camera_fb_get();
+      if(fb){
+        videoFile.write(fb->buf, fb->len);
+        esp_camera_fb_return(fb);
+      }
     }
   }
   if(landingDetected && recordingDescent){
     videoFile.close();
     recordingDescent = false;
+    SD_MMC.end();
   }
 }
 // put function definitions here:
@@ -270,6 +278,7 @@ void bmpTaskCode(void *parameter){
           previousAlt = currentAlt; //creates a snapshot every detectionTime seconds to compare to current altitude
         }
       }
+      currentAlt = 0;
       for(int i=0; i<altArraySize; i++){
         currentAlt += altArray[i];
       }
@@ -279,33 +288,54 @@ void bmpTaskCode(void *parameter){
 
     //Pass flight stages to main loop
 
-    if(onGround){
+    if(beforeFlight){
       if(detectLaunch()){
-        onGround = false;
+        beforeFlight = false;
       }
     }
-    if(!onGround){
+    if(!beforeFlight && !apogeeDetected){
       if(detectApogee()){
         apogeeDetected = true;
       }
     }
-    if(!onGround && apogeeDetected){
+    if(!beforeFlight && apogeeDetected && !landingDetected){
       if(detectLanding()){
         landingDetected = true;
       }
     }
 
     //Writing alt to ram
-    if(millis() - previousMillis >= bmpDataDelay){
-      bmpDataArray[currentIndex].altF = bmp.readFloatAltitudeFeet();;
-      bmpDataArray[currentIndex].tempF = bmp.readTempF();
-      bmpDataArray[currentIndex].presP = bmp.readFloatPressure();
-      bmpDataArray[currentIndex].timeM = millis();
-      currentIndex++;
-      if(currentIndex >= bmpDataArraySize){
-        currentIndex = 0; //wrap around to the beginning of the array
+    if(!landingDetected){
+      if(millis() - bmpPreviousMillis >= bmpDataDelay){
+        bmpDataArray[currentIndex].altF = bmp.readFloatAltitudeFeet();;
+        bmpDataArray[currentIndex].tempF = bmp.readTempF();
+        bmpDataArray[currentIndex].presP = bmp.readFloatPressure();
+        bmpDataArray[currentIndex].timeM = millis();
+        currentIndex++;
+        if(currentIndex >= bmpDataArraySize){
+          currentIndex = 0; //wrap around to the beginning of the array
+        }
+        bmpPreviousMillis = millis();
       }
     }
+    if(landingDetected){
+      vTaskDelay(1000 / portTICK_PERIOD_MS); //wait a second to make sure the last reading is saved to ram
+      File bmpDataFile = SD_MMC.open("/bmpData.csv", FILE_WRITE);
+      if(bmpDataFile){
+        bmpDataFile.println("Altitude (ft),Temperature (F),Pressure (Pa),Time (ms)");
+        for(int i=0; i<currentIndex; i++){
+          bmpDataFile.print(bmpDataArray[i].altF);
+          bmpDataFile.print(",");
+          bmpDataFile.print(bmpDataArray[i].tempF);
+          bmpDataFile.print(",");
+          bmpDataFile.print(bmpDataArray[i].presP);
+          bmpDataFile.print(",");
+          bmpDataFile.println(bmpDataArray[i].timeM);
+        }
+        bmpDataFile.close();
+      }
+      vTaskDelete(NULL); //delete this task since it is no longer needed
+    } 
     vTaskDelay(1 / portTICK_PERIOD_MS);
   }
 }
